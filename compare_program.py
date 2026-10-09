@@ -4,18 +4,96 @@ import os
 import json
 from typing import Any, Dict, List, Tuple, Optional
 from datetime import datetime
+from pathlib import Path
 import pandas as pd
 from pandas.tseries.offsets import BDay
+import numpy as np
 import logging
 from openpyxl.styles import PatternFill
 from openpyxl.utils import get_column_letter
-from validation_process import read_excel_user_inputs
+from data_loader import read_excel_user_inputs
 _logger = logging.getLogger(__name__)
 
 
 # ---------- System text file field mapping ----------
 # Each entry: (output_key, prefix, start_pos_1based, length)
 # Positions are absolute from start of line (not from prefix).
+def is_anniversary(issue_date_str, last_date_str, cycle_date):
+    """Check if last_date is an anniversary of issue_date (same month/day, different year)."""
+    from dateutil.relativedelta import relativedelta
+    issue = datetime.strptime(issue_date_str, "%Y-%m-%d")
+    last = datetime.strptime(last_date_str, "%Y-%m-%d")
+    diff = relativedelta(last, issue)
+    is_anniversary_primary = diff.years > 0 and diff.months == 0 and diff.days == 0
+
+    diff = relativedelta(cycle_date, issue)
+    is_anniversary_additional = diff.years > 0 and diff.months == 0 and diff.days == 0
+
+    return is_anniversary_primary or is_anniversary_additional
+         
+def format_rate(val):
+    # 1. Handle null/missing values safely
+    if pd.isna(val):
+        return val
+    
+    # 2. Convert to string to standardize processing
+    val_str = str(val).strip()
+    
+    # 3. Handle strings that contain the " / " suffix
+    if " / " in val_str:
+        parts = val_str.split(" / ", 1)
+        try:
+            return f"{float(parts[0]):.2f}% / {parts[1]}"
+        except ValueError:
+            return val_str # Fallback if text parsing fails
+            
+    # 4. Handle pure numbers or string numbers (like "103", 95.5, 8)
+    try:
+        return f"{float(val_str):.2f}%"
+    except ValueError:
+        return val_str # Fallback for unexpected text structures
+
+
+def get_last_transaction_date(policy):
+    """Get the last transaction date for a policy."""
+    days = policy.get("days", {})
+    if not days:
+        return None
+
+    dates = []
+    for day_key, day_data in days.items():
+        if "date" in day_data:
+            dates.append(day_data["date"])
+
+    if not dates:
+        return None
+
+    return max(dates)
+
+def filter_policies(pols_dict, output_file, cycle_date):
+    policies_to_delete = []
+
+    for pol_key, policy in pols_dict.items():
+        iss_date = policy.get("issDate")
+        if not iss_date:
+            continue
+
+        last_date = get_last_transaction_date(policy)
+        if not last_date:
+            continue
+        
+        # filter out non anniversary policy, or issue date not 
+        if (not is_anniversary(iss_date, last_date, cycle_date)) or datetime.strptime(last_date, "%Y-%m-%d") > datetime(cycle_date.year, cycle_date.month, cycle_date.day):
+            policies_to_delete.append(pol_key)
+
+    for pol_key in policies_to_delete:
+        del pols_dict[pol_key]
+
+    with open(output_file, "w") as f:
+        json.dump(pols_dict, f, indent=2)
+
+    return pols_dict
+
 
 def _clean_number(raw: str) -> Optional[float]:
     """Strip, remove $, commas, %, convert to float. Returns None on failure."""
@@ -33,7 +111,7 @@ def _format_percentage(raw: str) -> Optional[str]:
     num = _clean_number(raw)
     if num is None:
         return None
-    return f"{num:06.2f}%"
+    return f"{float(num):.2f}%"
 
 
 def _filter_sys_txt_by_policies(file_path: str, policy_nums: set) -> List[str]:
@@ -197,8 +275,8 @@ def _parse_sys_fund_level(lines: List[str]) -> pd.DataFrame:
     }
 
     STRING_FIELDS = {
-        "alloc_fund_name", "alloc_term_start", "alloc_term_end",
-        "alloc_upside_type", "locked_fund_name", "lock_fixed_rate",
+        "alloc_fund_name", "alloc_term_start", "alloc_term_end", "alloc_pct",
+        "alloc_upside_type", "alloc_upside_rate", "locked_fund_name", "lock_fixed_rate",
         "mid_fund_name", "eot_fund_name", "perf_fund_name",
         "perf_term_start", "perf_term_end", "perf_upside_rate",
         "perf_downside_buffer",
@@ -252,9 +330,10 @@ def _parse_sys_fund_level(lines: List[str]) -> pd.DataFrame:
             continue
 
         # Initialize new fund record with all fields set to None
-        rec = fund_records.setdefault(fund_name_val, {k: None for k in all_field_keys})
+        record_key = (policy_num, fund_name_val)
+        rec = fund_records.setdefault(record_key, {k: None for k in all_field_keys})
 
-        # Store policy_num if extracted
+        # Store policy_num and fund name if extracted
         if policy_num is not None:
             rec["_policy_num"] = policy_num
 
@@ -275,17 +354,30 @@ def _parse_sys_fund_level(lines: List[str]) -> pd.DataFrame:
     records = [dict(rec) for rec in fund_records.values()]
     df = pd.DataFrame(records)
     
+    # Exclusion rule application: No concurrent existence between alloc field group and locked field group
+    mask = df['alloc_fund_name'].notna() & df['locked_fund_name'].notna()
+    new_rows = df[mask].copy()
+    new_rows['locked_fund_name'] = pd.NA
+    new_rows.loc[:, ['av_locked', 'lock_fixed_rate', 'int_credited_fixed', 'av_locked_plus_int']] = np.nan
+    
+    df.loc[mask, ['alloc_fund_name', 'alloc_term_start', 'alloc_term_end','alloc_upside_type', 'alloc_upside_rate']] = pd.NA
+    df.loc[mask, ['alloc_contract_value', 'alloc_pct', 'alloc_buffer']] = np.nan
+    df = pd.concat([df, new_rows], ignore_index=True)
+    str_cols = ['alloc_fund_name', 'alloc_term_start', 'alloc_term_end','alloc_upside_type', 'alloc_upside_rate', 'locked_fund_name']
+    df[str_cols] = df[str_cols].astype(str)
+
     # Move policy_num to first column if present
     if "_policy_num" in df.columns:
         df.rename(columns={"_policy_num": "policy_num"}, inplace=True)
         cols = df.columns.tolist()
         cols = ["policy_num"] + [col for col in cols if col != "policy_num"]
         df = df[cols]
-    
+
+
     return df
 
 
-def _export_pol_comparison_to_excel(pol_items_df: pd.DataFrame, sys_pol_df: pd.DataFrame, results_basepath: str) -> None:
+def _export_pol_comparison_to_excel(pol_items_df: pd.DataFrame, sys_pol_df: pd.DataFrame, results_basepath: str, run_id: str) -> None:
     """
     Merge program and system policy-level DataFrames, build comparison columns,
     and export to Excel.
@@ -307,32 +399,81 @@ def _export_pol_comparison_to_excel(pol_items_df: pd.DataFrame, sys_pol_df: pd.D
     # Merge on policy_num
     comp_df = pd.merge(prog_df, sys_df, on="policy_num", how="outer")
 
-    # Create comparison columns: round both sides to 2 decimals, check equality
+    # Create comparison columns: round both sides to 1 decimals, check equality
     prog_cols = [col for col in comp_df.columns if col.startswith("prog_")]
+
     for prog_col in prog_cols:
+        
         base_col = prog_col[5:]
         sys_col = f"sys_{base_col}"
+        
         if sys_col in comp_df.columns:
-            comp_df[f"cmp_{base_col}"] = (
-                comp_df[prog_col].round(2) == comp_df[sys_col].round(2)
-            )
+            p_vals = pd.to_numeric(comp_df[prog_col], errors='coerce')
+            s_vals = pd.to_numeric(comp_df[sys_col], errors='coerce')
+            
+            
+
+            # Calculate absolute difference
+            abs_diff = (p_vals - s_vals).abs()
+            
+            # Check for "Both are Null"
+            both_null = p_vals.isna() & s_vals.isna()
+            
+            # Match if difference < 0.5 OR both are null
+            comp_df[f"cmp_{base_col}"] = (abs_diff < 0.5) | both_null
 
     # Aggregate match column (AND of all cmp_ columns)
     cmp_cols = [col for col in comp_df.columns if col.startswith("cmp_")]
     if cmp_cols:
         comp_df["cmp_all_match"] = comp_df[cmp_cols].all(axis=1)
 
-    # Move cmp_all_match to first column
-    cols = ["cmp_all_match"] + [c for c in comp_df.columns if c != "cmp_all_match"]
+    # Aggregate system columns and check if they are empty
+    sys_cols = [col for col in comp_df.columns if col.startswith("sys_")]
+    if sys_cols:
+        all_sys_empty = comp_df[sys_cols].isna().all(axis=1)
+    
+    # Custom comment for empty sys columns
+    comp_df["cmp_comment"] = ""  # Default empty string
+    comp_df.loc[all_sys_empty, "cmp_comment"] = "Policy in pull list"
+
+    # Move cmp_all_match and cmp_comment to leading column
+    cols = ["cmp_all_match"] + ["cmp_comment"] + [c for c in comp_df.columns if (c != "cmp_all_match" and c != "cmp_comment")]
     comp_df = comp_df[cols]
 
     # Export to Excel
-    excel_path = os.path.join(results_basepath, "comp_pol_level_items.xlsx")
+    excel_path = os.path.join(results_basepath, f"AS_comp_pol_level_items_{run_id}.xlsx")
     with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
         comp_df.to_excel(writer, index=False, sheet_name="Comparisons")
+        worksheet = writer.sheets['Comparisons']
+        yellow_fill = PatternFill(start_color='FFFF00', end_color='FFFF00', fill_type='solid')
+
+        for col_idx, col in enumerate(comp_df.columns, start=1):
+            if col.startswith('cmp_'):
+                # Get the suffix (e.g., 'mid_strat_base')
+                base_name = col.removeprefix('cmp_')
+                cmp_col = get_column_letter(col_idx)
+                try:
+                    # Try to find both counterparts
+                    prog_col = get_column_letter(comp_df.columns.get_loc(f'prog_{base_name}') + 1)
+                    sys_col = get_column_letter(comp_df.columns.get_loc(f'sys_{base_name}') + 1)
+                    
+                    # If mismatch on comparison fields, color the comparison cells, prog cells and sys cells
+                    for row_idx in range(2, len(comp_df) + 2):
+                        if worksheet[f'{cmp_col}{row_idx}'].value is False:
+                            worksheet[f'{cmp_col}{row_idx}'].fill = yellow_fill
+                            worksheet[f'{prog_col}{row_idx}'].fill = yellow_fill
+                            worksheet[f'{sys_col}{row_idx}'].fill = yellow_fill
+                
+                except KeyError:
+                    # Fallback: If prog_ or sys_ are missing, only color the cmp_ column
+                    for row_idx in range(2, len(comp_df) + 2):
+                        if worksheet[f'{cmp_col}{row_idx}'].value is False:
+                            worksheet[f'{cmp_col}{row_idx}'].fill = yellow_fill
+                    continue 
+        worksheet.freeze_panes = 'D2'
 
 
-def _export_fund_comparison_to_excel(fund_items_df: pd.DataFrame, sys_fund_df: pd.DataFrame, results_basepath: str) -> None:
+def _export_fund_comparison_to_excel(fund_items_df: pd.DataFrame, sys_fund_df: pd.DataFrame, results_basepath: str, run_id: str) -> None:
     """
     Merge program and system fund-level DataFrames, build comparison columns,
     and export to Excel with conditional formatting.
@@ -355,17 +496,47 @@ def _export_fund_comparison_to_excel(fund_items_df: pd.DataFrame, sys_fund_df: p
     prog_df = fund_items_df.copy()
     sys_df = sys_fund_df.copy()
 
-    # Create join key before renaming
-    prog_df['_join_key'] = prog_df['perf_fund_name']
-    sys_df['_join_key'] = sys_df['perf_fund_name']
+    # some hardcoded fund name string replacement to force match prog and sys fund name styles
+    for col in [col for col in sys_df.columns if "fund_name" in col]:
+        sys_df[col] = sys_df[col].str.replace(
+            r"Dual Dir w Cap", "Dual Dir with Cap",regex=True
+        )
+
+    for col in [col for col in prog_df.columns if "fund_name" in col]:
+        prog_df[col] = prog_df[col].str.replace(
+            r" MOD1", "", regex=True
+        )
+
+    composite_fields = [
+        "policy_num", "alloc_fund_name", "locked_fund_name", 
+        "mid_fund_name", "eot_fund_name", "perf_fund_name"
+    ]
+
+    # Build the key by cleaning the literal strings on the fly
+    sys_df["_composite_key"] = (
+        sys_df[composite_fields]
+        .astype(str)
+        .replace(["NaN", "nan", "None", "<NA>"], "") # Clean literal strings
+        .fillna("")                                 # Clean actual nulls
+        .agg("|".join, axis=1)                      # Join with separator
+    )
+
+    prog_df["_composite_key"] = (
+        prog_df[composite_fields]
+        .astype(str)
+        .replace(["NaN", "nan", "None", "<NA>"], "") # Clean literal strings
+        .fillna("")                                 # Clean actual nulls
+        .agg("|".join, axis=1)                      # Join with separator
+    )
 
     # Rename columns to distinguish program from system
-    prog_df.rename(columns={col: f"prog_{col}" for col in prog_df.columns if col != "_join_key"}, inplace=True)
-    sys_df.rename(columns={col: f"sys_{col}" for col in sys_df.columns if col != "_join_key"}, inplace=True)
+    skip_cols = ["_composite_key"]
+    prog_df.rename(columns={col: f"prog_{col}" for col in prog_df.columns if col not in skip_cols}, inplace=True)
+    sys_df.rename(columns={col: f"sys_{col}" for col in sys_df.columns if col not in skip_cols}, inplace=True)
 
-    # Merge on join key to keep both fund names
-    comp_df = pd.merge(prog_df, sys_df, on="_join_key", how="outer")
-    comp_df.drop(columns=["_join_key"], inplace=True)
+
+    # Merge on join keys to keep both fund names
+    comp_df = pd.merge(prog_df, sys_df, on=["_composite_key"], how="outer")
 
     # Normalize date and percentage fields before comparison
     date_fields = ["alloc_term_start", "alloc_term_end", 'perf_term_start', 'perf_term_end']
@@ -381,8 +552,13 @@ def _export_fund_comparison_to_excel(fund_items_df: pd.DataFrame, sys_fund_df: p
         for prefix in ("prog_", "sys_"):
             col = f"{prefix}{field}"
             if col in comp_df.columns:
-                comp_df[col] = comp_df[col].apply(
-                    lambda x: _format_percentage(str(x)) if x is not None else None
+                # 1. Cast the column to object/string type first
+                comp_df[col] = comp_df[col].astype(object)
+                
+                # 2. Now apply the formatting
+                mask = comp_df[col].notnull()
+                comp_df.loc[mask, col] = comp_df.loc[mask, col].apply(
+                    lambda x: _format_percentage(str(x))
                 )
 
     # Create comparison columns for each prog/sys pair
@@ -392,28 +568,46 @@ def _export_fund_comparison_to_excel(fund_items_df: pd.DataFrame, sys_fund_df: p
         sys_col = f"sys_{base_col}"
         if sys_col not in comp_df.columns:
             continue
-
+        
         prog_vals = comp_df[prog_col]
         sys_vals = comp_df[sys_col]
+        # Identify where both are null
+        both_null = prog_vals.isna() & sys_vals.isna()
 
-        if comp_df[prog_col].dtype == "object" or comp_df[sys_col].dtype == "object":
+        if ((comp_df[prog_col].dtype == "str" and comp_df[sys_col].dtype == "str") or 
+            (comp_df[prog_col].dtype == "object" and comp_df[sys_col].dtype == "object")):
             # String comparison (case-insensitive)
-            comp_df[f"cmp_{base_col}"] = prog_vals.astype(str).str.lower() == sys_vals.astype(str).str.lower()
+            p_str = prog_vals.fillna("").astype(str).str.lower()
+            s_str = sys_vals.fillna("").astype(str).str.lower()
+            comp_df[f"cmp_{base_col}"] = (p_str == s_str) | both_null
         else:
             # Numeric comparison (subtraction)
-            comp_df[f"diff_{base_col}"] = prog_vals - sys_vals
+            p_num = pd.to_numeric(prog_vals, errors='coerce')
+            s_num = pd.to_numeric(sys_vals, errors='coerce')
+            
+            diff = (p_num - s_num).round(1)
+            comp_df[f"cmp_{base_col}"] = (diff.abs() < 0.5) | both_null
 
     # Collect all cmp column names for aggregate calculation
     cmp_cols = [col for col in comp_df.columns if col.startswith('cmp_')]
     if cmp_cols:
         comp_df['cmp_all_match'] = comp_df[cmp_cols].all(axis=1)
 
-    # Move cmp_all_match to first column
-    cols = ["cmp_all_match"] + [c for c in comp_df.columns if c != "cmp_all_match"]
+    # Aggregate system columns and check if they are empty
+    sys_cols = [col for col in comp_df.columns if col.startswith("sys_")]
+    if sys_cols:
+        all_sys_empty = comp_df[sys_cols].isna().all(axis=1)
+    
+    # Custom comment for empty sys columns
+    comp_df["cmp_comment"] = ""  # Default empty string
+    comp_df.loc[all_sys_empty, "cmp_comment"] = "Policy in pull list"
+
+    # Move cmp_all_match and cmp_comment to leading column
+    cols = ["cmp_all_match"] + ["cmp_comment"] + [c for c in comp_df.columns if (c != "cmp_all_match" and c != "cmp_comment")]
     comp_df = comp_df[cols]
 
     # Export to Excel with conditional formatting for FALSE values
-    excel_path = os.path.join(results_basepath, "comp_fund_level_items.xlsx")
+    excel_path = os.path.join(results_basepath, f"AS_comp_fund_level_items_{run_id}.xlsx")
     with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
         comp_df.to_excel(writer, index=False, sheet_name='Comparisons')
 
@@ -422,13 +616,50 @@ def _export_fund_comparison_to_excel(fund_items_df: pd.DataFrame, sys_fund_df: p
 
         for col_idx, col in enumerate(comp_df.columns, start=1):
             if col.startswith('cmp_'):
-                col_letter = get_column_letter(col_idx)
-                for row_idx in range(2, len(comp_df) + 2):
-                    cell = worksheet[f'{col_letter}{row_idx}']
-                    if cell.value is False:
-                        cell.fill = yellow_fill
+                # Get the suffix (e.g., 'mid_strat_base')
+                base_name = col.removeprefix('cmp_')
+                cmp_col = get_column_letter(col_idx)
+                try:
+                    # Try to find both counterparts
+                    prog_col = get_column_letter(comp_df.columns.get_loc(f'prog_{base_name}') + 1)
+                    sys_col = get_column_letter(comp_df.columns.get_loc(f'sys_{base_name}') + 1)
+                    
+                    # If mismatch on comparison fields, color the comparison cells, prog cells and sys cells
+                    for row_idx in range(2, len(comp_df) + 2):
+                        if worksheet[f'{cmp_col}{row_idx}'].value is False:
+                            worksheet[f'{cmp_col}{row_idx}'].fill = yellow_fill
+                            worksheet[f'{prog_col}{row_idx}'].fill = yellow_fill
+                            worksheet[f'{sys_col}{row_idx}'].fill = yellow_fill
+                
+                except KeyError:
+                    # Fallback: If prog_ or sys_ are missing, only color the cmp_ column
+                    for row_idx in range(2, len(comp_df) + 2):
+                        if worksheet[f'{cmp_col}{row_idx}'].value is False:
+                            worksheet[f'{cmp_col}{row_idx}'].fill = yellow_fill
+                    continue 
+        worksheet.freeze_panes = 'D2'
 
-def _export_txn_fund_comparison_to_excel(txn_items_df: pd.DataFrame, sys_txn_df: pd.DataFrame, results_basepath: str) -> None:
+def add_join_key(df: pd.DataFrame) -> None:
+    """Constructs and adds the standard 'join_key' column directly to the DataFrame."""
+    
+    
+    policy = df["policy_num"].fillna("").astype(str)
+    
+    txn_date = df["txn_date"].fillna("")
+    term_start = df["term_start_date"].fillna("")
+    txn_desc = df["txn_type_desc"].fillna("")
+    fund_name = df["fund_name"].fillna("")
+    
+    df["_join_key"] = (
+        policy + "|" +
+        txn_date + "|" +
+        term_start + "|" +
+        txn_desc + "|" +
+        fund_name
+    )
+
+
+def _export_txn_fund_comparison_to_excel(txn_items_df: pd.DataFrame, sys_txn_df: pd.DataFrame, results_basepath: str, run_id: str) -> None:
     """
     Merge program and system transaction-fund-level DataFrames, build comparison columns,
     and export to Excel with conditional formatting.
@@ -446,6 +677,8 @@ def _export_txn_fund_comparison_to_excel(txn_items_df: pd.DataFrame, sys_txn_df:
     prog_df = txn_items_df.copy()
     sys_df = sys_txn_df.copy()
 
+    prog_df["fund_name"] = prog_df["fund_name"].str.replace(r" MOD1", "", regex=True)
+    sys_df["fund_name"] = sys_df["fund_name"].str.replace(r"Dual Dir w Cap", "Dual Dir with Cap", regex=True)
     # Convert date fields to datetime objects for proper chronological sorting
     for df in (prog_df, sys_df):
         if "txn_date" in df.columns:
@@ -466,19 +699,10 @@ def _export_txn_fund_comparison_to_excel(txn_items_df: pd.DataFrame, sys_txn_df:
                 df[field] = pd.to_datetime(df[field], errors="coerce").dt.strftime("%Y-%m-%d")
 
     # Create composite join key BEFORE renaming
-    prog_df["_join_key"] = (
-        prog_df["txn_date"].fillna("") + "|" +
-        prog_df["term_start_date"].fillna("") + "|" +
-        prog_df["txn_type_desc"].fillna("") + "|" +
-        prog_df["fund_name"].fillna("")
-    )
-    sys_df["_join_key"] = (
-        sys_df["txn_date"].fillna("") + "|" +
-        sys_df["term_start_date"].fillna("") + "|" +
-        sys_df["txn_type_desc"].fillna("") + "|" +
-        sys_df["fund_name"].fillna("")
-    )
 
+    add_join_key(prog_df)
+    add_join_key(sys_df)
+    
     # Rename columns to distinguish program from system
     prog_df.rename(columns={col: f"prog_{col}" for col in prog_df.columns if col != "_join_key"}, inplace=True)
     sys_df.rename(columns={col: f"sys_{col}" for col in sys_df.columns if col != "_join_key"}, inplace=True)
@@ -490,30 +714,62 @@ def _export_txn_fund_comparison_to_excel(txn_items_df: pd.DataFrame, sys_txn_df:
     # Create comparison columns
     prog_cols = [col for col in comp_df.columns if col.startswith("prog_")]
     for prog_col in prog_cols:
-        base_col = prog_col[5:]
+        base_col = prog_col[5:]  # Strip 'prog_' prefix
         sys_col = f"sys_{base_col}"
+        
         if sys_col not in comp_df.columns:
             continue
 
-        prog_vals = comp_df[prog_col]
-        sys_vals = comp_df[sys_col]
+        # Use pd.to_numeric for the numeric check—this handles string-numbers like "100"
+        p_vals = comp_df[prog_col]
+        s_vals = comp_df[sys_col]
 
-        if comp_df[prog_col].dtype == "object" or comp_df[sys_col].dtype == "object":
-            comp_df[f"cmp_{base_col}"] = prog_vals.astype(str).str.lower() == sys_vals.astype(str).str.lower()
+        # Pre-calculate the "Both are Null" condition
+        both_null = p_vals.isna() & s_vals.isna()
+
+        if prog_col == "prog_upside_rate_fl":
+            p_vals = p_vals.apply(format_rate)
+
+        # Check if either column is a string type
+        if p_vals.dtype == "object" or p_vals.dtype == "string" or \
+        s_vals.dtype == "object" or s_vals.dtype == "string":
+            
+            # String Path: Fill NAs with a placeholder to avoid .str methods returning NaN
+            p_str = p_vals.fillna("").astype(str).str.strip().str.lower()
+            s_str = s_vals.fillna("").astype(str).str.strip().str.lower()
+            
+            comp_df[f"cmp_{base_col}"] = (p_str == s_str) | both_null
         else:
-            comp_df[f"diff_{base_col}"] = prog_vals - sys_vals
+            # Numeric Path: Use to_numeric to safely handle potential mixed types
+            p_num = pd.to_numeric(p_vals, errors='coerce')
+            s_num = pd.to_numeric(s_vals, errors='coerce')
+            
+            # Subtraction results in NaN if one is missing, which != 0.0 (Correct)
+            diff = (p_num - s_num).round(1)
+            
+            # Result is True if diff is 0 OR if both were null to begin with
+            comp_df[f"cmp_{base_col}"] = (diff == 0.0) | both_null
 
     # Aggregate column
     cmp_cols = [col for col in comp_df.columns if col.startswith('cmp_')]
     if cmp_cols:
         comp_df['cmp_all_match'] = comp_df[cmp_cols].all(axis=1)
 
-    # Move cmp_all_match to first column
-    cols = ["cmp_all_match"] + [c for c in comp_df.columns if c != "cmp_all_match"]
+    # Aggregate system columns and check if they are empty
+    sys_cols = [col for col in comp_df.columns if col.startswith("sys_")]
+    if sys_cols:
+        all_sys_empty = comp_df[sys_cols].isna().all(axis=1)
+    
+    # Custom comment for empty sys columns
+    comp_df["cmp_comment"] = ""  # Default empty string
+    comp_df.loc[all_sys_empty, "cmp_comment"] = "Policy in pull list"
+
+    # Move cmp_all_match and cmp_comment to leading column
+    cols = ["cmp_all_match"] + ["cmp_comment"] + [c for c in comp_df.columns if (c != "cmp_all_match" and c != "cmp_comment")]
     comp_df = comp_df[cols]
 
     # Export to Excel
-    excel_path = os.path.join(results_basepath, "comp_txn_fund_level_items.xlsx")
+    excel_path = os.path.join(results_basepath, f"AS_comp_txn_fund_level_items_{run_id}.xlsx")
     with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
         comp_df.to_excel(writer, index=False, sheet_name='Comparisons')
 
@@ -522,11 +778,28 @@ def _export_txn_fund_comparison_to_excel(txn_items_df: pd.DataFrame, sys_txn_df:
 
         for col_idx, col in enumerate(comp_df.columns, start=1):
             if col.startswith('cmp_'):
-                col_letter = get_column_letter(col_idx)
-                for row_idx in range(2, len(comp_df) + 2):
-                    cell = worksheet[f'{col_letter}{row_idx}']
-                    if cell.value is False:
-                        cell.fill = yellow_fill
+                # Get the suffix (e.g., 'mid_strat_base')
+                base_name = col.removeprefix('cmp_')
+                cmp_col = get_column_letter(col_idx)
+                try:
+                    # Try to find both counterparts
+                    prog_col = get_column_letter(comp_df.columns.get_loc(f'prog_{base_name}') + 1)
+                    sys_col = get_column_letter(comp_df.columns.get_loc(f'sys_{base_name}') + 1)
+                    
+                    # If mismatch on comparison fields, color the comparison cells, prog cells and sys cells
+                    for row_idx in range(2, len(comp_df) + 2):
+                        if worksheet[f'{cmp_col}{row_idx}'].value is False:
+                            worksheet[f'{cmp_col}{row_idx}'].fill = yellow_fill
+                            worksheet[f'{prog_col}{row_idx}'].fill = yellow_fill
+                            worksheet[f'{sys_col}{row_idx}'].fill = yellow_fill
+                
+                except KeyError:
+                    # Fallback: If prog_ or sys_ are missing, only color the cmp_ column
+                    for row_idx in range(2, len(comp_df) + 2):
+                        if worksheet[f'{cmp_col}{row_idx}'].value is False:
+                            worksheet[f'{cmp_col}{row_idx}'].fill = yellow_fill
+                    continue 
+        worksheet.freeze_panes = 'D2'
 
 
 def _parse_sys_txn_fund_level(lines: List[str]) -> pd.DataFrame:
@@ -585,6 +858,30 @@ def _parse_sys_txn_fund_level(lines: List[str]) -> pd.DataFrame:
             raw_amt = stripped[96:96+25].strip() if len(stripped) >= 121 else ""
             amount = _clean_number(raw_amt)
 
+            # Extract amount (pos 212, len 15)
+            raw_int = stripped[211:211+15].strip() if len(stripped) >= 226 else ""
+            int_rate = _clean_number(raw_int)
+
+            # Extract amount (pos 227, len 15)
+            raw_alloc_pct = stripped[226:226+15].strip() if len(stripped) >= 241 else ""
+            alloc_pct = _clean_number(raw_alloc_pct)
+
+            # Extract amount (pos 242, len 20)
+            raw_index = stripped[241:241+20].strip() if len(stripped) >= 261 else ""
+            index_val = _clean_number(raw_index)
+
+            # Extract amount (pos 262, len 15)
+            raw_buffer = stripped[261:261+15].strip() if len(stripped) >= 276 else ""
+            buffer_rate = _clean_number(raw_buffer)
+
+            # Extract amount (pos 277, len 25)
+            raw_upside_type = stripped[276:276+25].strip() if len(stripped) >= 301 else ""
+            upside_param = raw_upside_type if raw_upside_type else None
+
+            # Extract amount (pos 302, len 25)
+            raw_upside_rate = stripped[301:301+25].strip() if len(stripped) >= 326 else ""
+            upside_rate = raw_upside_rate if raw_upside_rate else None
+
             records.append({
                 "policy_num": current_header.get("policy_num"),
                 "txn_date": current_header.get("txn_date"),
@@ -592,7 +889,13 @@ def _parse_sys_txn_fund_level(lines: List[str]) -> pd.DataFrame:
                 "fund_name": fund_name,
                 "term_start_date": term_start,
                 "term_end_date": term_end,
-                "txn_amount": amount,
+                "txn_amt": amount,
+                "int_rate": int_rate,
+                "alloc_pct_upon_fl": alloc_pct,
+                "index_upon_fl": index_val,
+                "buffer_fl": buffer_rate,
+                "upside_type_fl": upside_param,
+                "upside_rate_fl": upside_rate
             })
 
     return pd.DataFrame(records)
@@ -602,7 +905,7 @@ def _parse_sys_txn_fund_level(lines: List[str]) -> pd.DataFrame:
 # Main entry point
 # ----------------------------
 
-def run_compare_process(results_basepath: str, UI_file_path: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def run_compare_process(results_basepath: str, UI_file_path: str, pols_dict: Dict):
     """
     Read pols_structure.json in results_basepath and extract Annual Statement items one by one
     Then extract the same AS items from printing team's text file (sysfile).
@@ -613,33 +916,48 @@ def run_compare_process(results_basepath: str, UI_file_path: str) -> Tuple[pd.Da
                          If provided, the file will be copied into results_basepath.
     """
     os.makedirs(results_basepath, exist_ok=True)
+    run_id = results_basepath.split('\\')[-1]
 
-    df_run_option, _ = read_excel_user_inputs(UI_file_path)
+    df_run_option, _, _= read_excel_user_inputs(UI_file_path)
     statement_run_bool = df_run_option["Statement Run"].iloc[0]
-    statement_date = df_run_option["Cycle Date"].iloc[0] + BDay(1)
+    cycle_date = datetime.strptime(df_run_option["Cycle Date"].iloc[0], "%Y-%m-%d").date()
+
+    if not statement_run_bool:
+        _logger.info("User opts for no AS comparison")
+        return
+
+    if pd.isna(df_run_option["Cycle Date"].iloc[0]):
+        data_df = pd.read_csv(Path(results_basepath) / '1. Data_Txn_Level_Fund_Unpivoted_Original.csv')
+        max_date = data_df['EFFECTIVE_DATE'].max()
+        statement_date = pd.to_datetime(max_date) + BDay(1)
+    else:
+        statement_date = cycle_date + BDay(1)
     statement_date = statement_date.strftime('%Y%m%d')
-    sys_txt_src_dir = r"\\PWASCO000751001.msad.crbgf.net\RAStatements\Actuarial\\" + statement_date + "\\"
-    
+
+    sys_txt_src_dir = r"\\PWASCO000751001.msad.crbgf.net\RAStatements\Actuarial\\" + statement_date + r"\\"
+
     # Copy system text file from placeholder directory if specified
     if statement_run_bool:
         import shutil
+        if not Path(sys_txt_src_dir).is_dir():
+            _logger.info(sys_txt_src_dir)
+            _logger.info("Statement text file directory for this cycle date does not exist yet. Compare program aborted.")
+            return
         txt_files = [f for f in os.listdir(sys_txt_src_dir) if f.endswith(".txt")]
         if txt_files:
             src_txt = os.path.join(sys_txt_src_dir, txt_files[0])
             dst_txt = os.path.join(results_basepath, txt_files[0])
             if not os.path.exists(dst_txt):
                 shutil.copy2(src_txt, dst_txt)
-                _logger.info("Copied %s to %s", txt_files[0], results_basepath)
+                _logger.info(f"Copied %s to %s", txt_files[0], "output folder.")
             else:
-                _logger.info("System text file already exists in %s", results_basepath)
+                _logger.info(f"System text file already exists in %s", results_basepath)
 
-    pols_path = os.path.join(results_basepath, "pols_structure.json")
-    if not os.path.exists(pols_path):
-        raise FileNotFoundError(f"Could not find pols_structure.json at: {pols_path}")
-
-    # unpacks the JSON data dump to dictionary
-    with open(pols_path, "r") as f:
-        pols = json.load(f)
+    filtered_json = os.path.join(results_basepath, "pols_structure_forAS.json")
+    pols = filter_policies(pols_dict, filtered_json, cycle_date)
+    if not pols:
+        _logger.warning("The filtered JSON object for statement is empty. Compare program aborted")
+        return
 
     # Normalize: pols may have string keys "0","1",...
     if isinstance(pols, dict):
@@ -674,6 +992,7 @@ def run_compare_process(results_basepath: str, UI_file_path: str) -> Tuple[pd.Da
             ))
 
     fund_items_df = pd.DataFrame(fund_items_rows)
+    
 
     # ---------- Extract Transaction-Fund-Level items for AS from program JSON data dump ----------
     txn_fund_items_rows: List[Dict[str, Any]] = []
@@ -693,7 +1012,6 @@ def run_compare_process(results_basepath: str, UI_file_path: str) -> Tuple[pd.Da
         # Filter text file to only lines belonging to policies in pols_structure.json
         policy_nums = {pol.get("num") or pol.get("PC_CONT") for _, pol in pol_items}
         filtered_lines = _filter_sys_txt_by_policies(sys_txt_path, policy_nums)
-        _logger.info("Filtered system text file: %d lines for %d policies", len(filtered_lines), len(policy_nums))
 
         sys_pol_df = _parse_sys_pol_level(filtered_lines)
         sys_fund_df = _parse_sys_fund_level(filtered_lines)
@@ -706,17 +1024,17 @@ def run_compare_process(results_basepath: str, UI_file_path: str) -> Tuple[pd.Da
 
     # ---------- Write output ----------
     # ---------- Create combined comparison policy-level Excel ----------
-    _export_pol_comparison_to_excel(pol_items_df, sys_pol_df, results_basepath)
+    _export_pol_comparison_to_excel(pol_items_df, sys_pol_df, results_basepath, run_id)
 
     # ---------- Create combined comparison fund-level Excel ----------
-    _export_fund_comparison_to_excel(fund_items_df, sys_fund_df, results_basepath)
+    _export_fund_comparison_to_excel(fund_items_df, sys_fund_df, results_basepath, run_id)
 
     # ---------- Create combined comparison txn-fund-level Excel ----------
-    _export_txn_fund_comparison_to_excel(txn_fund_items_df, sys_txn_fund_df, results_basepath)
+    _export_txn_fund_comparison_to_excel(txn_fund_items_df, sys_txn_fund_df, results_basepath, run_id)
 
-    return pol_items_df, fund_items_df, txn_fund_items_df, sys_pol_df, sys_fund_df, sys_txn_fund_df
+    return
 
 if __name__ == "__main__":
-    run_compare_process(r"C:\AAA_RILA_Validation_Modernization\RILA_Python\Output_RILA\2026-04-10\b3224560-19cb-44eb-be10-155a48bc77f5", 
-                        r"C:\AAA_RILA_Validation_Modernization\RILA_Python\Input_RILA\RILA_Validation_UI_v1_Step1.xlsx")
+    run_compare_process(r"C:\RILA_Validation_Program_GIT\Output_RILA\2026-04-30\e1a0c438-e439-4e03-a4b1-1590f72d0e92", 
+                        r"C:\AAA_RILA_Validation_Modernization\RILA_Python\data_validation_Scripts\RILA_Validation_UI_v2.xlsm")
     pass
